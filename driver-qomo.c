@@ -50,24 +50,6 @@ static const struct qomo_device qomo_devices[] = {
     {0, 0, 0, 0, "/dev/spidev1.1", "/dev/i2c-dev1", 0x23},
 };
 
-static inline void __qomo_issue(struct qomo_device *dev, uint16_t cmd,
-        uint8_t *in, int in_len) {
-
-    memcpy(dev->echo, &cmd, 2);
-    memcpy(dev->echo, in, in_len);
-    memcpy(dev->echo, "\x00\x00", 2);
-
-    spi_clear_buf(dev->spi);
-    spi_emit_buf(dev->spi, dev->issue, in_len + 4);
-    spi_txrx(dev->spi);
-}
-
-static inline int __qomo_echo(struct qomo_device *dev, int n) {
-    spi_clear_buf(dev->spi);
-    spi_emit_nop(dev->spi, n);
-    return spi_txrx(dev->spi);
-}
-
 static inline int __qomo_exec_cmd(struct qomo_device *dev,
         uint16_t cmd, int chip_addr, uint8_t *in, int in_len) {
 
@@ -197,7 +179,7 @@ static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
 
 static bool qomo_lowl_probe(const struct lowlevel_device_info * info)
 {
-    int bus, cs, chains = 0, chips;
+    int bus, cs, chains = 0, chips, ret;
     char data[64];
 
     for (d = 0; d < ARRAY_SIZE(qomo_devices); d++) {
@@ -219,30 +201,39 @@ static bool qomo_lowl_probe(const struct lowlevel_device_info * info)
 
         /* 3. configure PLL and SPI clock for each compute board
         */
-        if(qomo_exec_cmd(dev, QOMO_WRITE_REG, data) < 0) {
-            applog(LOG_ERROR, "board %d does not response to cmd 0x%x", d, QOMO_WRITE_REG);
+        ret = qomo_exec_cmd(dev, QOMO_WRITE_REG, 0,
+                /* pll */
+                "\x00\x00\x00\x00"
+                /* time-delta interval between each core power up */
+                "\x00\x00"
+                /* reserved 4, BIST mode, mask update, job mode, power up mode */
+                "\x0a\x00", NULL);
+        if (ret < 0) {
+            continue;
         }
 
         /* 4. BIST
         */
-        if(qomo_exec_cmd(dev, QOMO_BIST, data) < 0) {
-        }
+        if(qomo_exec_cmd(dev, QOMO_BIST, 0, NULL, NULL) < 0) {
+            continue;
+        };
 
         /* 5. auto addressing
         */
-        if(qomo_exec_cmd(dev, QOMO_AUTO_ADDRESSING, data) < 0) {
-            chips = 0;
+        if(qomo_exec_cmd(dev, QOMO_AUTO_ADDRESSING, 0, "\x00\x01",
+                    &dev->chip_count) < 0) {
+            continue;
         }
+        applog(LOG_NOTICE, "%d chips detected in chain", dev->chip_count);
 
         /* 6. Mask out bad cores inside each chip
         */
-        if(qomo_exec_cmd(dev, QOMO_BIST_FIX, data) < 0) {
+        if(qomo_exec_cmd(dev, QOMO_BIST_FIX, 0, NULL, NULL) < 0) {
+            continue;
         }
 
         /* 7. count good cores inside each chip (optional)
          */
-        if(qomo_exec_cmd(dev, QOMO_BIST_FIX, data) < 0) {
-        }
 
         /* add cgpu */
         struct cgpu_info *cgpu = malloc(sizeof(struct cgpu_info));
@@ -278,15 +269,39 @@ struct qomo_thread_shutdown(const struct thr_info * thr)
     applog(LOG_DEBUG, "%s, %d", __func__, __LINE__);
 }
 
+static void wswap32cp(void *dst, void *src, int len)
+{
+    uint16_t *t = dst, *s = src;
+    int i = 0;
+    for (; i < len; i += 2, t += 2, s += 2) {
+        *(t + i) = *(s + i + 1);
+        *(t + i + 1) = *(s + i);
+    }
+}
+
+static void qomo_prepare_payload(uint8_t *pl, struct work *work)
+{
+    wswap32cp(pl, &work->data[16], 64);
+    wswap32cp(pl + 64, work->data, 16);
+    /* start nonce */
+    *(uint32_t *)&pl[64] = 0;
+    /* end nonce */
+    *(uint32_t *)&pl[84] = 0xffffffff;
+    /* difficulty */
+    *(uint32_t *)&pl[80] = 0xff1effff;
+}
+
 #ifdef UNION_MODE    
 struct qomo_scanhash(struct thr_info *thr, struct work *work, int64_t __maybe_unused max_nonce)
 {
-    int nonce;
+    int nonce, ret[4];
     struct cgpu_info *cgpu = thr->cgpu;
     struct qomo_device *dev = cgpu->device_data;
     struct timeval start_tv, end_tv, nonce_scanned_tv;
+    char payload[128];
 
-    qomo_exec_cmd(QOMO_WRITE_JOB, work);
+    qomo_prepare_payload(payload, work);
+    qomo_exec_cmd(dev, QOMO_WRITE_JOB, 0, payload, NULL);
     timer_set_now(&start_tv);
     timer_set_delay_from_now(&nonce_scanned_tv,
             dev->range_scan_us / dev->chip_nr_max);
@@ -309,17 +324,20 @@ struct qomo_scanhash(struct thr_info *thr, struct work *work, int64_t __maybe_un
         }
 
         /* scan for nonce */
-        qomo_exec_cmd(QOMO_SCAN_NONCE, &nonce);
-        if (nonce_found) {
-            submit_nonce(thr, work, nonce);
+        qomo_exec_cmd(dev, QOMO_GET_NONCE, 0, "\x00\x00\x00\x00", ret);
+        if (ret[0]) {
+            submit_nonce(thr, work, ret[1]);
+            dev->chip_perf[ret[2]]++;
         }
 
         /* sleep for a while thus let go of the bus */
         cgsleep_ms(100);
     }
 
-    /* clear potential results for the current work */
-    qomo_exec_cmd(QOMO_RESET);
+    /* clear potential results for the current work
+     * reserved 5, output queue, BIST, cores
+     */
+    qomo_exec_cmd(dev, QOMO_RESET, 0, "\x00\x04", NULL);
 
     work->blk.nonce = 0xffffffff;
     timer_set_now(&end_tv);
