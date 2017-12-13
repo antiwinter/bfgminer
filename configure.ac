@@ -598,6 +598,12 @@ BFG_DRIVER(,ZeusMiner,scrypt Icarus,auto,[
 	$broad_udevrules && have_udevrules=true
 ])
 
+BFG_DRIVER(,Qomo,scrypt,auto,[
+	need_lowl_spi=yes
+	has_asic=yes
+	$broad_udevrules && have_udevrules=true
+])
+
 BFG_DRIVER(,GridSeed,scrypt,auto,[
 	need_gc3355=yes
 	need_lowl_vcom=yes
