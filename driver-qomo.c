@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <linux/spi/spidev.h>
 
 #include "deviceapi.h"
 #include "lowl-spi.h"
@@ -36,7 +37,8 @@
 
 #define UNION_MODE
 
-static const int chip_nr_max = 128;
+#define CHIP_NR_MAX 128
+
 struct qomo_device {
     int sig0, sig1, sig2, sig3;
     char *spi_path, *iic_path;
@@ -46,8 +48,8 @@ struct qomo_device {
     int chip_count;
     int range_scan_us;
     int hash_rate;
-    int chip_perf[chip_nr_max];
-    int chip_good_core[chip_nr_max];
+    int chip_perf[CHIP_NR_MAX];
+    int chip_good_core[CHIP_NR_MAX];
 };
 
 enum qomo_commands {
@@ -112,7 +114,7 @@ __qomo_echo_assert(struct qomo_device *dev, int m) {
 
 static inline uint16_t
 __qomo_echo_get_word(struct qomo_device *dev, int m) {
-    return (uint16_t)(dev->spi.spibuf_rx + dev->spi.spibufsz - m);
+    return *(uint16_t *)(dev->spi.spibuf_rx + dev->spi.spibufsz - m);
 }
 
 static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
@@ -206,7 +208,7 @@ static bool qomo_lowl_probe(const struct lowlevel_device_info * info)
         struct qomo_device *dev = &qomo_devices[d];
         dev->spi.speed = 3000000;
         dev->spi.delay = 0;
-        dev->spi.mode = 0;
+        dev->spi.mode = SPI_MODE_0;
         dev->spi.bits = 8;
 
         if(spi_open(&dev->spi, dev->spi_path) < 0) {
@@ -328,7 +330,7 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
     qomo_exec_cmd(dev, QOMO_WRITE_JOB, 0, payload, NULL);
     timer_set_now(&start_tv);
     timer_set_delay_from_now(&nonce_scanned_tv,
-            dev->range_scan_us / chip_nr_max);
+            dev->range_scan_us / CHIP_NR_MAX);
 
     for(;;) {
         /* we control the hash loop for ourselves, and set
