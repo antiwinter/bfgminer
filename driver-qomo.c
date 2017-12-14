@@ -29,7 +29,12 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+#ifdef HAVE_LINUX_SPI_SPIDEV_H
 #include <linux/spi/spidev.h>
+#else
+#define SPI_MODE_0 0
+#endif
 
 #include "deviceapi.h"
 #include "lowl-spi.h"
@@ -211,10 +216,12 @@ static bool qomo_lowl_probe(const struct lowlevel_device_info * info)
         dev->spi.mode = SPI_MODE_0;
         dev->spi.bits = 8;
 
+#ifdef HAVE_LINUX_SPI_SPIDEV_H
         if(spi_open(&dev->spi, dev->spi_path) < 0) {
             applog(LOG_NOTICE, "%s not found", dev->spi_path);
             continue;
         }
+#endif
 
         /*
          * 1. configure DCDC to get correct voltage for each computing board

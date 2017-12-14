@@ -67,3 +67,10 @@ core*
 *.zip
 *.tbz2
 *.bz2
+ccan-upstream
+libbase58
+libblkmaker
+malgo
+tags
+test-driver
+
