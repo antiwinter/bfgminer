@@ -40,7 +40,11 @@
 #include "lowl-spi.h"
 #include "util.h"
 
-#define UNION_MODE
+/* SYNC_MODE: write job in braodcast mode, all chips in the chain will do the
+ *            same job (nonce is divided into 128 range for each chip)
+ * if not defined: request a work for each chip separately from bfgminer
+ */
+#define SYNC_MODE
 
 #define CHIP_NR_MAX 128
 
@@ -313,17 +317,24 @@ static void wswap32cp(void *dst, void *src, int len)
 
 static void qomo_prepare_payload(uint8_t *pl, struct work *work)
 {
+    uint32_t i;
+
     wswap32cp(pl, &work->data[16], 64);
     wswap32cp(pl + 64, work->data, 16);
+
     /* start nonce */
     *(uint32_t *)&pl[64] = 0;
+
     /* end nonce */
     *(uint32_t *)&pl[84] = 0xffffffff;
+
     /* difficulty */
-    *(uint32_t *)&pl[80] = 0xff1effff;
+    for (i = 31; i >= 2 && !work->target[i]; --i);
+    wswap32cp(pl + 80, work->target + i - 2, 4);
+    pl[81] = i + 1;
 }
 
-#ifdef UNION_MODE    
+#ifdef SYNC_MODE    
 static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
         int64_t __maybe_unused max_nonce)
 {
@@ -390,7 +401,7 @@ struct device_drv qomo_drv = {
     .thread_disable = qomo_thread_disable,
     .thread_shutdown = qomo_thread_shutdown,
 
-#ifdef UNION_MODE    
+#ifdef SYNC_MODE    
     .scanhash = qomo_scanhash,
 #else
     .minierloop = minerloop_queue,
