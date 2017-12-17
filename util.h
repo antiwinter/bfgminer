@@ -840,5 +840,7 @@ extern uint8_t crc8ccitt(const void *, size_t);
 extern uint16_t crc16(const void *, size_t, uint16_t init);
 #define crc16ffff(  DATA, SZ)  crc16(DATA, SZ, 0xffff)
 #define crc16xmodem(DATA, SZ)  crc16(DATA, SZ, 0)
+extern void printbin(char *s, void *d, int n);
+
 
 #endif /* __UTIL_H__ */

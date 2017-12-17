@@ -817,6 +817,21 @@ void bin2hex(char *out, const void *in, size_t len)
 	out[0] = '\0';
 }
 
+void printbin(char *s, void *d, int n)
+{
+    int i, _n = 0;
+    printf("%s\n", s);
+    for (i = 0; i < n; i++) {
+        printf("%02x ", *((uint8_t *)d + i));
+        ++_n;
+        if ((i + 1) % 16 == 0) {
+            printf("\n");
+            _n = 0;
+        }
+    }
+    if(_n) printf("\n");
+}
+
 static inline
 int _hex2bin_char(const char c)
 {
