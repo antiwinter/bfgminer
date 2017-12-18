@@ -47,6 +47,8 @@
 #define SYNC_MODE
 
 #define CHIP_NR_MAX 128
+#define CHIP_CORES_NR 64
+#define HASH_CYCLE  10000
 
 BFG_REGISTER_DRIVER(qomo_drv)
 
@@ -57,11 +59,14 @@ struct qomo_device {
     int prep_sz;
     int slave_addr;
     struct spi_port spi;
-    int chip_count;
+    int chips_nr;
+    int mode;
+    float voltage;
     int range_scan_us;
-    int hash_rate;
-    int chip_perf[CHIP_NR_MAX];
-    int chip_good_core[CHIP_NR_MAX];
+    double hash_rate;
+    double freq;
+    uint32_t chip_bist[CHIP_NR_MAX];
+    double chip_perf[CHIP_NR_MAX];
 };
 
 enum qomo_commands {
@@ -88,7 +93,7 @@ static inline int __qomo_exec_cmd(struct qomo_device *dev,
         uint16_t cmd, int chip_addr, uint8_t *in, int in_len) {
 
     struct spi_port *spi = &dev->spi;
-    int ret;
+    int ret, dn;
 
     /* back up tx data to dev->prep */
     cmd |= chip_addr;
@@ -110,13 +115,15 @@ static inline int __qomo_exec_cmd(struct qomo_device *dev,
     spi_emit_buf(spi, dev->prep, in_len + 6);
     printbin("cmd send:", spi->spibuf, in_len + 6);
     spi_txrx(spi);
+    printbin("cmd echo:", spi->spibuf_rx, in_len + 6);
 
     /* send demanding dummy to get the response */
+    dn = chip_addr? 4 * chip_addr - 2: 4 * dev->chips_nr;
     spi_clear_buf(spi);
-    spi_emit_nop(spi, chip_addr? 4 * chip_addr - 2: 4 * dev->chip_count);
+    spi_emit_nop(spi, dn);
+    applog(LOG_NOTICE, "dummy data: %d\n", dn);
     ret = spi_txrx(spi);
-    printbin("cmd echo:", spi->spibuf_rx, chip_addr? 4 * chip_addr
-            - 2: 4 * dev->chip_count);
+    printbin("dummy echo:", spi->spibuf_rx, dn);
     return ret;
 }
 
@@ -224,28 +231,27 @@ static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
 }
 
 struct device_drv qomo_drv;
+static const struct bfg_set_device_definition qomo_set_device_funcs[];
+
 static void qomo_drv_detect(void)
 {
     int chains = 0, chips, ret, d;
     char data[64];
     
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
     for (d = 0; d < ARRAY_SIZE(qomo_devices); d++) {
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
         struct qomo_device *dev = &qomo_devices[d];
         dev->spi.speed = 3000000;
         dev->spi.delay = 0;
         dev->spi.mode = SPI_MODE_0;
         dev->spi.bits = 8;
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
 
+    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
 #ifdef HAVE_LINUX_SPI_SPIDEV_H
         if(spi_open(&dev->spi, dev->spi_path) < 0) {
             applog(LOG_NOTICE, "%s not found", dev->spi_path);
             continue;
         }
 #endif
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
 
         /*
          * 1. configure DCDC to get correct voltage for each computing board
@@ -263,13 +269,13 @@ static void qomo_drv_detect(void)
                  * reserved 4
                  * BIST mode, mask update, job mode, power up mode
                  * RO 8 */
-                "\x00\x0a", NULL);
+                "\x0a\x00", NULL);
         if (ret < 0) {
             continue;
         }
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
+
         /* TODO: calc difficulty and range_scan_us and hash_rate */
-        dev->range_scan_us = 500000000;
+        dev->range_scan_us = 4096 * HASH_CYCLE / dev->freq / CHIP_CORES_NR;
 
         /* 4. BIST
         */
@@ -281,10 +287,10 @@ static void qomo_drv_detect(void)
         /* 5. auto addressing
         */
         if(qomo_exec_cmd(dev, QOMO_AUTO_ADDRESSING, 0, "\x00\x01",
-                    &dev->chip_count) < 0) {
+                    &dev->chips_nr) < 0) {
             continue;
         }
-        applog(LOG_NOTICE, "%d chips detected in chain", dev->chip_count);
+        applog(LOG_NOTICE, "%d chips detected in chain", dev->chips_nr);
 
         /* 6. Mask out bad cores inside each chip
         */
@@ -304,6 +310,7 @@ static void qomo_drv_detect(void)
         cgpu->device_data = dev;
         cgpu->threads = 1;
         cgpu->procs = chips;
+        cgpu->set_device_funcs = qomo_set_device_funcs;
     applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
         add_cgpu(cgpu);
     applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
@@ -366,6 +373,10 @@ static void qomo_prepare_payload(uint8_t *pl, struct work *work)
     pl[81] = i + 1;
 }
 
+#if 0
+/* the code here is for matching block/byte order from network
+ * to asic. just call test_byte_order(work) in function scanhash
+ */
 void test_byte_feed(uint8_t *buf, uint8_t *src, int n, int loop, int s4, int s2)
 {
     uint8_t buf_s2[32], buf_s4[32], buf_loop[32];
@@ -456,8 +467,10 @@ void test_byte_order(struct work *work) {
             _test(data3, data1, data2);
             _test(data3, data2, data1);
             }
+printf("\n\nTHE END\n");
 for (;;);
 }
+#endif
 
 #ifdef SYNC_MODE    
 static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
@@ -469,7 +482,6 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
     struct timeval start_tv, end_tv, nonce_scanned_tv;
     uint8_t payload[128];
 
-    test_byte_order(work);
     qomo_prepare_payload(payload, work);
     qomo_exec_cmd(dev, QOMO_WRITE_JOB, 0, payload, NULL);
     timer_set_now(&start_tv);
@@ -492,6 +504,7 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
         /* range nearly scanned */
         if(timer_passed(&nonce_scanned_tv, NULL)) {
             applog(LOG_NOTICE, "range scanned (time passed)");
+            cgsleep_ms(2000);
             break;
         }
 
@@ -516,7 +529,7 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
         }
 
         /* sleep for a while thus let go of the bus */
-        cgsleep_ms(1000);
+        cgsleep_ms(100);
     }
 
     /* clear potential results for the current work
@@ -531,12 +544,66 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
 #else /* manage jobs for each chip separately */
 #endif
 
-#if 0
+const char *qomo_set_device(struct cgpu_info * const cgpu,
+        const char *opt, const char * newval, char * reply,
+        enum bfg_set_device_replytype *out_success)
+{
+    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
+    applog(LOG_NOTICE, "opt: %s, newval: %s", opt, newval);
+    sprintf(reply, "echo %s %s", opt, newval);
+    return NULL;
+}
+char *qomo_set_device_drv(struct cgpu_info *cgpu,
+        char *opt, char *newval, char *reply) {
+    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
+    applog(LOG_NOTICE, "opt: %s, newval: %s", opt, newval);
+    sprintf(reply, "echo %s %s", opt, newval);
+    return NULL;
+}
+
+/* APIs support by qomo */
 static const struct bfg_set_device_definition
-qomo_set_device_funcsp[] = {
-    {"clock", qomo_}
+qomo_set_device_funcs[] = {
+    {"clock", qomo_set_device, "set chips frequency, number, unit MHz"},
+    {"voltage", qomo_set_device, "set chips voltage, number, unit mV"},
+    {"fan-speed", qomo_set_device, "set fan-speed, 5 levels, [1, 2, 3, 4, 5]"}
 };
-#endif
+
+struct api_data* qomo_get_api_extra_device_detail(struct cgpu_info *cgpu) {
+    struct qomo_device *dev = cgpu->device_data;
+    struct api_data *res = NULL;
+    char name[16];
+    int i;
+
+    res = api_add_int(res, "chips_nr", &dev->chips_nr, 1);
+    res = api_add_string(res, "work mode", dev->mode? "sync": "async", 1);
+
+    for (i = 0; i < dev->chips_nr; i++) {
+        sprintf(name, "c_bist_%d", i);
+        res = api_add_uint32(res, name, &dev->chip_bist[i], 1);
+    }
+
+    return res;
+}
+
+struct api_data* qomo_get_api_extra_device_status(struct cgpu_info *cgpu) {
+    struct qomo_device *dev = cgpu->device_data;
+    struct api_data *res = NULL;
+    char name[16];
+    int i;
+
+    res = api_add_volts(res, "voltage", &dev->voltage, 1);
+    res = api_add_freq(res, "frequency", &dev->freq, 1);
+    res = api_add_mhs(res, "estimate_hash_rate", &dev->hash_rate, 1);
+    res = api_add_int(res, "range_scan_time", &dev->range_scan_us, 1);
+
+    for (i = 0; i < dev->chips_nr; i++) {
+        sprintf(name, "c_pf_%d", i);
+        res = api_add_double(res, name, &dev->chip_perf[i], 1);
+    }
+
+    return res;
+}
 
 struct device_drv qomo_drv = {
     .dname = "intchains_qomo",
@@ -566,5 +633,10 @@ struct device_drv qomo_drv = {
      * the algorithm check
      */
     .drv_min_nonce_diff = common_scrypt_min_nonce_diff,
+
+    /* API */
+    .set_device = qomo_set_device_drv,
+    .get_api_extra_device_detail = qomo_get_api_extra_device_detail,
+    .get_api_extra_device_status = qomo_get_api_extra_device_status,
 };
 
