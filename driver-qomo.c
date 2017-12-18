@@ -28,6 +28,7 @@
 
 #include <unistd.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdbool.h>
 
 #ifdef HAVE_LINUX_SPI_SPIDEV_H
@@ -49,6 +50,8 @@
 #define CHIP_NR_MAX 128
 #define CHIP_CORES_NR 64
 #define HASH_CYCLE  10000
+#define DEFAULT_FREQ 400
+#define DEFAULT_SPI_FREQ 3000000
 
 BFG_REGISTER_DRIVER(qomo_drv)
 
@@ -59,10 +62,12 @@ struct qomo_device {
     int prep_sz;
     int slave_addr;
     struct spi_port spi;
+    int id;
     int chips_nr;
+    int cores_nr;
     int mode;
     float voltage;
-    int range_scan_us;
+    double range_scan_time;
     double hash_rate;
     double freq;
     uint32_t chip_bist[CHIP_NR_MAX];
@@ -232,20 +237,20 @@ static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
 
 struct device_drv qomo_drv;
 static const struct bfg_set_device_definition qomo_set_device_funcs[];
-
 static void qomo_drv_detect(void)
 {
-    int chains = 0, chips, ret, d;
+    int chains = 0, chips, ret, d, id = 0;
     char data[64];
     
     for (d = 0; d < ARRAY_SIZE(qomo_devices); d++) {
         struct qomo_device *dev = &qomo_devices[d];
-        dev->spi.speed = 3000000;
+        dev->spi.speed = DEFAULT_SPI_FREQ;
         dev->spi.delay = 0;
         dev->spi.mode = SPI_MODE_0;
         dev->spi.bits = 8;
+        dev->freq = DEFAULT_FREQ;
+        dev->id = id++;
 
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
 #ifdef HAVE_LINUX_SPI_SPIDEV_H
         if(spi_open(&dev->spi, dev->spi_path) < 0) {
             applog(LOG_NOTICE, "%s not found", dev->spi_path);
@@ -253,69 +258,16 @@ static void qomo_drv_detect(void)
         }
 #endif
 
-        /*
-         * 1. configure DCDC to get correct voltage for each computing board
-         * 2. perform HW reset for each computing board
-         */
-
-        /* 3. configure PLL and SPI clock for each compute board
-        */
-        ret = qomo_exec_cmd(dev, QOMO_REG_WRITE, 0,
-                /* 32 bits: pll */
-                "\x00\x00\x00\x00"
-                /* 16 bits: time-delta interval between each core power up */
-                "\x00\x00"
-                /* 16 bits:
-                 * reserved 4
-                 * BIST mode, mask update, job mode, power up mode
-                 * RO 8 */
-                "\x0a\x00", NULL);
-        if (ret < 0) {
-            continue;
-        }
-
-        /* TODO: calc difficulty and range_scan_us and hash_rate */
-        dev->range_scan_us = 4096 * HASH_CYCLE / dev->freq / CHIP_CORES_NR;
-
-        /* 4. BIST
-        */
-        if(qomo_exec_cmd(dev, QOMO_BIST, 0, NULL, NULL) < 0) {
-            continue;
-        };
-
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-        /* 5. auto addressing
-        */
-        if(qomo_exec_cmd(dev, QOMO_AUTO_ADDRESSING, 0, "\x00\x01",
-                    &dev->chips_nr) < 0) {
-            continue;
-        }
-        applog(LOG_NOTICE, "%d chips detected in chain", dev->chips_nr);
-
-        /* 6. Mask out bad cores inside each chip
-        */
-        if(qomo_exec_cmd(dev, QOMO_BIST_FIX, 0, NULL, NULL) < 0) {
-            continue;
-        }
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-
-        /* 7. count good cores inside each chip (optional)
-         */
-
         /* add cgpu, use calloc which init memory to zero */
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
         struct cgpu_info *cgpu = calloc(1, sizeof(struct cgpu_info));
-    applog(LOG_NOTICE, "%s, %d, %p, %lu", __func__, __LINE__, cgpu, sizeof(struct cgpu_info));
         cgpu->drv = &qomo_drv;
         cgpu->device_data = dev;
         cgpu->threads = 1;
         cgpu->procs = chips;
         cgpu->set_device_funcs = qomo_set_device_funcs;
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
+
         add_cgpu(cgpu);
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
         chains++;
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
     }
 
     if (chains) applog(LOG_NOTICE, "QomoMiner detected, %d chains totally!", chains);
@@ -324,7 +276,72 @@ static void qomo_drv_detect(void)
 
 static bool qomo_thread_init(struct thr_info *thr)
 {
+    struct cgpu_info *cgpu = thr->cgpu;
+    struct qomo_device *dev = cgpu->device_data;
+    uint8_t reg[32];
+    int ret, i;
+
     applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
+    /*
+     * 1. configure DCDC to get correct voltage for each computing board
+     * 2. perform HW reset for each computing board
+     */
+
+    /* 3. configure PLL and SPI clock for each compute board
+    */
+    ret = qomo_exec_cmd(dev, QOMO_REG_WRITE, 0,
+            /* 32 bits: pll */
+            "\x00\x00\x00\x00"
+            /* 16 bits: time-delta interval between each core power up */
+            "\x00\x00"
+            /* 16 bits:
+             * reserved 4
+             * BIST mode, mask update, job mode, power up mode
+             * RO 8 */
+            "\x0a\x00", NULL);
+    if (ret < 0) {
+        return false;
+    }
+
+    /* TODO: calc difficulty and range_scan_time and hash_rate */
+    dev->range_scan_time = 4096.0;
+    dev->range_scan_time /= dev->freq * CHIP_CORES_NR / HASH_CYCLE;
+
+    applog(LOG_NOTICE, "range scan time for a chip is %.2lfs@%.2lfMHz",
+            dev->range_scan_time, dev->freq);
+
+    /* 4. BIST
+    */
+    if(qomo_exec_cmd(dev, QOMO_BIST, 0, NULL, NULL) < 0) {
+        return false;
+    };
+
+    /* 5. auto addressing
+    */
+    if(qomo_exec_cmd(dev, QOMO_AUTO_ADDRESSING, 0, "\x00\x01",
+                &dev->chips_nr) < 0) {
+        return false;
+    }
+    applog(LOG_NOTICE, "%d chips detected in chain", dev->chips_nr);
+
+    /* 6. Mask out bad cores inside each chip
+    */
+    if(qomo_exec_cmd(dev, QOMO_BIST_FIX, 0, NULL, NULL) < 0) {
+        return false;
+    }
+
+    /* 7. count good cores inside each chip (optional)
+    */
+    for (i = 1; i <= dev->chips_nr; i++) {
+        if(qomo_exec_cmd(dev, QOMO_REG_READ, i, NULL, reg) < 0) {
+            applog(LOG_ERR, "dev %d: read reg for chip %d failed", dev->id, i);
+            continue;
+        }
+        dev->cores_nr += reg[7];
+        dev->chip_bist[i] = *(uint64_t *)&reg[8];
+    }
+    applog(LOG_NOTICE, "dev %d: %d good cores", dev->id, dev->cores_nr);
+
     return true;
 }
 
@@ -358,19 +375,22 @@ static void qomo_prepare_payload(uint8_t *pl, struct work *work)
     uint32_t i;
 
     applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-    wswap32cp(pl, &work->data[16], 64);
-    wswap32cp(pl + 64, work->data, 16);
+    bswap_32mult(pl, work->data, 32);
+    bswap_32mult(pl + 32, work->data + 32, 32);
+    bswap_32mult(pl + 64, work->data + 64, 16);
 
     /* start nonce */
-    *(uint32_t *)&pl[64] = 0;
+    *(uint32_t *)&pl[64] = bswap_32(0x0);
 
     /* end nonce */
-    *(uint32_t *)&pl[84] = 0xffffffff;
+    *(uint32_t *)&pl[84] = bswap_32(0xffffffff);
 
     /* difficulty */
-    for (i = 31; i >= 2 && !work->target[i]; --i);
-    wswap32cp(pl + 80, work->target + i - 2, 4);
-    pl[81] = i + 1;
+    for (i = 0; !work->target[31 - i]; i++);
+    pl[80] = i;
+    pl[81] = work->target[31 - i];
+    pl[82] = work->target[31 - i - 1];
+    pl[83] = work->target[31 - i - 2];
 }
 
 #if 0
@@ -432,7 +452,7 @@ void test_byte_order(struct work *work) {
         0xc5, 0x01, 0xef, 0x15, 0x99, 0xfc, 0x48, 0xed,
         0x6c, 0xba, 0xc9, 0x20, 0xaf, 0x75, 0x57, 0x56
     }, data3[16] = {
-	0x00, 0x00, 0x31, 0x8f, 0x7e, 0x71, 0x44, 0x1b,
+        0x00, 0x00, 0x31, 0x8f, 0x7e, 0x71, 0x44, 0x1b,
         0x14, 0x1f, 0xe9, 0x51, 0xb2, 0xb0, 0xc7, 0xdf
     }, hash[32] = {
         0xb3, 0x03, 0x00, 0x00, 0x66, 0xbd, 0x9f, 0x06,
@@ -483,10 +503,11 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
     uint8_t payload[128];
 
     qomo_prepare_payload(payload, work);
+    printbin("payload:", payload, 88);
     qomo_exec_cmd(dev, QOMO_WRITE_JOB, 0, payload, NULL);
     timer_set_now(&start_tv);
     timer_set_delay_from_now(&nonce_scanned_tv,
-            dev->range_scan_us / CHIP_NR_MAX);
+            (int)(dev->range_scan_time * 1000000 / CHIP_NR_MAX));
 
     for(;;) {
         /* we control the hash loop for ourselves, and set
@@ -504,14 +525,12 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
         /* range nearly scanned */
         if(timer_passed(&nonce_scanned_tv, NULL)) {
             applog(LOG_NOTICE, "range scanned (time passed)");
-            cgsleep_ms(2000);
             break;
         }
 
         /* scan for nonce */
         qomo_exec_cmd(dev, QOMO_GET_NONCE, 0, "\x00\x00\x00\x00", ret);
-//        if (ret[0]) {
-        if (1) {
+        if (ret[0]) {
             uint32_t _nonce[6] = {
                 0xbe8c9a19,
                 0x8e54a019,
@@ -523,7 +542,7 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
             static int nnn = 0;
             ret[1] = _nonce[nnn++];
             nnn = nnn > 3? 0: nnn;
- //           applog(LOG_NOTICE, "submitting nonce: 0x%08x", ret[1]);
+            //           applog(LOG_NOTICE, "submitting nonce: 0x%08x", ret[1]);
             submit_nonce(thr, work, ret[1]);
             dev->chip_perf[ret[2]]++;
         }
@@ -544,29 +563,38 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
 #else /* manage jobs for each chip separately */
 #endif
 
-const char *qomo_set_device(struct cgpu_info * const cgpu,
+char *qomo_set_device(struct cgpu_info * const cgpu,
+        const char *opt, const char *newval, char *reply) {
+    struct qomo_device *dev = cgpu->device_data;
+
+    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
+    applog(LOG_NOTICE, "opt: %s, newval: %s", opt, newval);
+    sprintf(reply, "echo %s %s", opt, newval);
+
+    if (strcmp(opt, "clock") == 0) {
+        dev->freq = atof(newval);
+        applog(LOG_NOTICE, "dev %d: freq set to %lf", dev->id, dev->freq);
+    }
+    return NULL;
+}
+
+const char *qomo_set_device_live(struct cgpu_info * const cgpu,
         const char *opt, const char * newval, char * reply,
         enum bfg_set_device_replytype *out_success)
 {
     applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
     applog(LOG_NOTICE, "opt: %s, newval: %s", opt, newval);
-    sprintf(reply, "echo %s %s", opt, newval);
-    return NULL;
-}
-char *qomo_set_device_drv(struct cgpu_info *cgpu,
-        char *opt, char *newval, char *reply) {
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-    applog(LOG_NOTICE, "opt: %s, newval: %s", opt, newval);
-    sprintf(reply, "echo %s %s", opt, newval);
+
+    qomo_set_device(cgpu, opt, newval, reply);
     return NULL;
 }
 
 /* APIs support by qomo */
 static const struct bfg_set_device_definition
 qomo_set_device_funcs[] = {
-    {"clock", qomo_set_device, "set chips frequency, number, unit MHz"},
-    {"voltage", qomo_set_device, "set chips voltage, number, unit mV"},
-    {"fan-speed", qomo_set_device, "set fan-speed, 5 levels, [1, 2, 3, 4, 5]"}
+    {"clock", qomo_set_device_live, "set chips frequency, number, unit MHz"},
+    {"voltage", qomo_set_device_live, "set chips voltage, number, unit mV"},
+    {"fan-speed", qomo_set_device_live, "set fan-speed, 5 levels, [1, 2, 3, 4, 5]"}
 };
 
 struct api_data* qomo_get_api_extra_device_detail(struct cgpu_info *cgpu) {
@@ -595,7 +623,7 @@ struct api_data* qomo_get_api_extra_device_status(struct cgpu_info *cgpu) {
     res = api_add_volts(res, "voltage", &dev->voltage, 1);
     res = api_add_freq(res, "frequency", &dev->freq, 1);
     res = api_add_mhs(res, "estimate_hash_rate", &dev->hash_rate, 1);
-    res = api_add_int(res, "range_scan_time", &dev->range_scan_us, 1);
+    res = api_add_double(res, "range_scan_time", &dev->range_scan_time, 1);
 
     for (i = 0; i < dev->chips_nr; i++) {
         sprintf(name, "c_pf_%d", i);
@@ -635,7 +663,7 @@ struct device_drv qomo_drv = {
     .drv_min_nonce_diff = common_scrypt_min_nonce_diff,
 
     /* API */
-    .set_device = qomo_set_device_drv,
+    .set_device = qomo_set_device,
     .get_api_extra_device_detail = qomo_get_api_extra_device_detail,
     .get_api_extra_device_status = qomo_get_api_extra_device_status,
 };
