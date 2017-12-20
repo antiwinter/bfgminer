@@ -45,7 +45,7 @@
  *            same work (nonce is divided into 128 range for each chip)
  * SYNC_MODE 0: request a work for each chip separately from bfgminer
  */
-#define SYNC_MODE 1
+#define SYNC_MODE 0
 
 #define CHIP_NR_MAX 32
 #define CHIP_CORES_NR 64
@@ -87,9 +87,9 @@ struct qomo_device {
     int nonce_ood;
     struct timeval valid_tv;
 #if SYNC_MODE == 1
-    struct qomo_wq wp;
+    struct qomo_wp wp;
 #else
-    struct qomo_wq wp[CHIP_NR_MAX];
+    struct qomo_wp wp[CHIP_NR_MAX];
 #endif
 };
 
@@ -126,7 +126,7 @@ static inline int qomo_wp_alloc_id(struct qomo_wp *wp, struct work * work) {
     timer_set_now(&wp->stamp_tv[wp->cursor]);
     wp->work[wp->cursor] = work;
     
-    return id;
+    return wp->cursor;
 }
 
 static inline int __qomo_exec_cmd(struct qomo_device *dev,
@@ -295,17 +295,17 @@ static void qomo_drv_detect(void)
     
     for (d = 0; d < ARRAY_SIZE(qomo_devices); d++) {
         struct qomo_device *dev = &qomo_devices[d];
-        dev->spi.speed = DEFAULT_SPI_FREQ;
-        dev->spi.delay = 0;
-        dev->spi.mode = SPI_MODE_0;
-        dev->spi.bits = 8;
-        dev->spi.txrx = linux_spi_txrx;
         dev->freq = DEFAULT_FREQ;
         dev->id = id++;
         dev->sync_mode = SYNC_MODE;
         dev->enabled = 1;
 
 #ifdef HAVE_LINUX_SPI_SPIDEV_H
+        dev->spi.speed = DEFAULT_SPI_FREQ;
+        dev->spi.delay = 0;
+        dev->spi.mode = SPI_MODE_0;
+        dev->spi.bits = 8;
+        dev->spi.txrx = linux_spi_txrx;
         if(spi_open(&dev->spi, dev->spi_path) < 0) {
             applog(LOG_NOTICE, "%s not found", dev->spi_path);
             continue;
@@ -553,7 +553,7 @@ for (;;);
 static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
         int64_t __maybe_unused max_nonce)
 {
-    int nonce, ret[4], i, work_id;
+    uint32_t nonce, ret[4], i, work_id, chip_id;
     struct cgpu_info *cgpu = thr->cgpu;
     struct qomo_device *dev = cgpu->device_data;
     struct timeval start_tv, end_tv;
@@ -647,13 +647,14 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
 
 bool qomo_queue_append(struct thr_info *thr, struct work * const work)
 {
-    struct qomo_device *dev = cthr->cgpu->device_data;
+    struct qomo_device *dev = thr->cgpu->device_data;
+    int i;
 
     for (i = 1; i <= dev->chips_nr; i++) {
         struct qomo_wp *wp = &dev->wp[i];
         if (timer_passed(&wp->expire, NULL)) { // null is now
             int work_id = qomo_wp_alloc_id(wp, work);
-            timer_set_delay_from_now(wp->expire,
+            timer_set_delay_from_now(&wp->expire,
                     (int)(dev->range_scan_time * 1000000));
 
             qomo_prepare_payload(dev, work);
@@ -668,7 +669,7 @@ bool qomo_queue_append(struct thr_info *thr, struct work * const work)
 static
 void qomo_queue_flush(struct thr_info * const thr)
 {
-    struct qomo_device *dev = cthr->cgpu->device_data;
+    struct qomo_device *dev = thr->cgpu->device_data;
     struct qomo_wp *wp;
     int i, j;
 
@@ -683,7 +684,7 @@ void qomo_queue_flush(struct thr_info * const thr)
 static
 void qomo_poll(struct thr_info * const thr)
 {
-    struct qomo_device *dev = cthr->cgpu->device_data;
+    struct qomo_device *dev = thr->cgpu->device_data;
     uint32_t ret[4], work_id, nonce, chip_id, ood;
     struct qomo_wp *wp;
 
@@ -704,7 +705,7 @@ one_more_nonce:
         }
 
         /* valid response */
-        wp = dev->wp[chip_id];
+        wp = &dev->wp[chip_id];
         if (timercmp(&wp->stamp_tv[work_id], &dev->valid_tv, >)) { /* valid nonce */
             submit_nonce(thr, wp->work[work_id], nonce);
         } else {
@@ -729,6 +730,7 @@ const char *qomo_set_device(struct cgpu_info * const cgpu,
         const char *opt, const char * newval, char * reply,
         enum bfg_set_device_replytype *out_success)
 {
+    struct qomo_device *dev = cgpu->device_data;
     applog(LOG_NOTICE, "qomo set_device: opt: %s, newval: %s", opt, newval);
 
     if (strcmp(opt, "clock") == 0) {
@@ -748,7 +750,12 @@ qomo_set_device_funcs_live[] = {
     {NULL}
 };
 static const struct bfg_set_device_definition
-*qomo_set_device_funcs = qomo_set_device_funcs_live;
+qomo_set_device_funcs[] = {
+    {"clock", qomo_set_device, "set chips frequency, number, unit MHz"},
+    {"voltage", qomo_set_device, "set chips voltage, number, unit mV"},
+    {"fan-speed", qomo_set_device, "set fan-speed, 5 levels, [1, 2, 3, 4, 5]"},
+    {NULL}
+};
 
 struct api_data* qomo_get_api_extra_device_detail(struct cgpu_info *cgpu) {
     struct qomo_device *dev = cgpu->device_data;
@@ -780,7 +787,7 @@ struct api_data* qomo_get_api_extra_device_status(struct cgpu_info *cgpu) {
 
     for (i = 0; i < dev->chips_nr; i++) {
         sprintf(name, "c_pf_%d", i);
-        res = api_add_double(res, name, &dev->chip_perf[i], 1);
+        res = api_add_int(res, name, &dev->chip_perf[i], 1);
     }
 
     return res;
@@ -801,10 +808,10 @@ struct device_drv qomo_drv = {
     .thread_disable = qomo_thread_disable,
     .thread_shutdown = qomo_thread_shutdown,
 
-#ifdef SYNC_MODE == 1
+#if SYNC_MODE == 1
     .scanhash = qomo_scanhash,
 #else
-    .minierloop = minerloop_queue,
+    .minerloop = minerloop_queue,
     .queue_append = qomo_queue_append,
     .queue_flush = qomo_queue_flush,
     .poll = qomo_poll,

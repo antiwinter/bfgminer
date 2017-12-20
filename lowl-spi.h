@@ -23,7 +23,7 @@ struct spi_port {
 	/* TX-RX single frame */
 	bool (*txrx)(struct spi_port *port);
 	
-	char spibuf[SPIMAXSZ], spibuf_rx[SPIMAXSZ];
+	uint8_t spibuf[SPIMAXSZ], spibuf_rx[SPIMAXSZ];
 	size_t spibufsz;
 	
 	void *userp;
