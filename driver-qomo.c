@@ -41,37 +41,56 @@
 #include "lowl-spi.h"
 #include "util.h"
 
-/* SYNC_MODE: write job in braodcast mode, all chips in the chain will do the
- *            same job (nonce is divided into 128 range for each chip)
- * if not defined: request a work for each chip separately from bfgminer
+/* SYNC_MODE 1: write work in braodcast mode, all chips in the chain will do the
+ *            same work (nonce is divided into 128 range for each chip)
+ * SYNC_MODE 0: request a work for each chip separately from bfgminer
  */
-#define SYNC_MODE
+#define SYNC_MODE 1
 
-#define CHIP_NR_MAX 128
+#define CHIP_NR_MAX 32
 #define CHIP_CORES_NR 64
 #define HASH_CYCLE  10000
-#define DEFAULT_FREQ 400
-#define DEFAULT_SPI_FREQ 3000000
+#define DEFAULT_FREQ 10
+#define DEFAULT_SPI_FREQ 400000
+#define WORK_ID_NR_MAX 16
 
 BFG_REGISTER_DRIVER(qomo_drv)
+
+/* work_id pool */
+struct qomo_wp {
+    struct timeval stamp_tv[WORK_ID_NR_MAX];
+    struct work * work[WORK_ID_NR_MAX];
+    int cursor;
+    struct timeval expire;
+};
 
 struct qomo_device {
     int sig0, sig1, sig2, sig3;
     char *spi_path, *iic_path;
-    char prep[512];
+    uint8_t prep[512];
+    uint8_t payload[512];
     int prep_sz;
+    int echo_loc;
     int slave_addr;
     struct spi_port spi;
     int id;
     int chips_nr;
     int cores_nr;
-    int mode;
+    int sync_mode;
+    int enabled;
     float voltage;
     double range_scan_time;
     double hash_rate;
     double freq;
     uint32_t chip_bist[CHIP_NR_MAX];
-    double chip_perf[CHIP_NR_MAX];
+    int chip_perf[CHIP_NR_MAX];
+    int nonce_ood;
+    struct timeval valid_tv;
+#if SYNC_MODE == 1
+    struct qomo_wq wp;
+#else
+    struct qomo_wq wp[CHIP_NR_MAX];
+#endif
 };
 
 enum qomo_commands {
@@ -80,7 +99,7 @@ enum qomo_commands {
     QOMO_BIST = 0x0100,
     QOMO_BIST_FIX = 0x0300,
     QOMO_AUTO_ADDRESSING = 0x0200,
-    QOMO_WRITE_JOB = 0x0700,
+    QOMO_WRITE_WORK = 0x0700,
     QOMO_GET_NONCE = 0x0800,
     QOMO_RESET = 0x0400,
 };
@@ -94,18 +113,34 @@ static struct qomo_device qomo_devices[] = {
 #endif
 };
 
+static inline void qomo_wp_invalidate(struct qomo_wp *wp) {
+    int i;
+    for (i = 0; i < WORK_ID_NR_MAX; i++)
+        wp->work[i] = NULL;
+}
+
+static inline int qomo_wp_alloc_id(struct qomo_wp *wp, struct work * work) {
+
+    ++wp->cursor;
+    if (wp->cursor == WORK_ID_NR_MAX) wp->cursor = 1;
+    timer_set_now(&wp->stamp_tv[wp->cursor]);
+    wp->work[wp->cursor] = work;
+    
+    return id;
+}
+
 static inline int __qomo_exec_cmd(struct qomo_device *dev,
         uint16_t cmd, int chip_addr, uint8_t *in, int in_len) {
 
     struct spi_port *spi = &dev->spi;
-    int ret, dn;
+    int ret, dn, i;
 
     /* back up tx data to dev->prep */
     cmd |= chip_addr;
     cmd = bswap_16(cmd);
 
-    memcpy(dev->prep, "\x5a\x3c", 2);
-    memcpy(dev->prep, &cmd, 2);
+    memcpy(dev->prep, "\xa5\x3c", 2);
+    memcpy(dev->prep + 2, &cmd, 2);
     if (likely(in_len)) {
         if (in)
             memcpy(dev->prep + 4, in, in_len);
@@ -115,20 +150,29 @@ static inline int __qomo_exec_cmd(struct qomo_device *dev,
     memcpy(dev->prep + 4 + in_len, "\x00\x00", 2);
     dev->prep_sz = in_len + 6;
 
-    /* send tx data */
+    dn = 4 * CHIP_NR_MAX;
+
     spi_clear_buf(spi);
     spi_emit_buf(spi, dev->prep, in_len + 6);
-    printbin("cmd send:", spi->spibuf, in_len + 6);
-    spi_txrx(spi);
-    printbin("cmd echo:", spi->spibuf_rx, in_len + 6);
 
-    /* send demanding dummy to get the response */
-    dn = chip_addr? 4 * chip_addr - 2: 4 * dev->chips_nr;
-    spi_clear_buf(spi);
+    /* add extra dummy data */
     spi_emit_nop(spi, dn);
-    applog(LOG_NOTICE, "dummy data: %d\n", dn);
-    ret = spi_txrx(spi);
-    printbin("dummy echo:", spi->spibuf_rx, dn);
+
+    /* send tx data */
+//    printbin("sent:", spi->spibuf, in_len + 6 + dn);
+    spi_txrx(spi);
+//    printbin("echo:", spi->spibuf_rx, in_len + 6 + dn);
+
+    /* set valid response loc */
+    dev->echo_loc = -1;
+    for (i = 0; i < spi->spibufsz - 1; i++) {
+        if (spi->spibuf_rx[i] == 0xa5 &&
+            spi->spibuf_rx[i + 1] == 0x3c) {
+            dev->echo_loc = i;
+            break;
+        }
+    }
+
     return ret;
 }
 
@@ -137,20 +181,26 @@ static inline int __qomo_exec_cmd(struct qomo_device *dev,
  */
 static inline int
 __qomo_echo_assert(struct qomo_device *dev) {
+    if (dev->echo_loc < 0) return -1;
     if (memcmp(dev->prep, dev->spi.spibuf_rx
-                + dev->spi.spibufsz - dev->prep_sz, dev->prep_sz) != 0) {
+                + dev->echo_loc, dev->prep_sz) != 0) {
         applog(LOG_ERR, "echo is not same as expected!");
         // bin2hex ...
+        printbin("prep:", dev->prep, dev->prep_sz);
+        printbin("echo:", dev->spi.spibuf_rx + dev->echo_loc, dev->prep_sz);
         return -1;
     }
 
     return 0;
 }
 
-/* get a word (16bit) from the last m bytes position */
+/* get a word (16bit) from the m bytes position */
 static inline uint16_t
 __qomo_echo_get_word(struct qomo_device *dev, int m) {
-    return *(uint16_t *)(dev->spi.spibuf_rx + dev->spi.spibufsz - m);
+    if (dev->echo_loc < 0) return 0xeeee;
+
+    return bswap_16(*(uint16_t *)(dev->spi.spibuf_rx
+            + dev->echo_loc + m));
 }
 
 static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
@@ -158,7 +208,6 @@ static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
     struct spi_port *spi = &dev->spi;
     int *ret = out, val;
 
-    return 0;
 #define refuse_single(x...) do { \
     if (chip_addr) { \
         applog(LOG_ERR, "cmd %d does not support single mode", cmd); \
@@ -180,11 +229,11 @@ static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
         case QOMO_REG_READ:
             refuse_bcast();
             __qomo_exec_cmd(dev, cmd, chip_addr, NULL, 14);
-            if (__qomo_echo_get_word(dev, 20) != (cmd | 0x1000 | chip_addr)) {
+            if (__qomo_echo_get_word(dev, 2) != (cmd | 0x8000 | chip_addr)) {
                 applog(LOG_ERR, "unexpected echo for cmd 0x%04x", cmd);
                 return -1;
             }
-            memcpy(out, spi->spibuf_rx + spi->spibufsz - 18, 16);
+            memcpy(out, spi->spibuf_rx + dev->echo_loc + 4, 16);
             return 0;
 
         case QOMO_BIST:
@@ -199,30 +248,30 @@ static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
         case QOMO_AUTO_ADDRESSING:
             refuse_single();
             __qomo_exec_cmd(dev, cmd, 0, in, 2);
-            if (__qomo_echo_get_word(dev, 6) != cmd) {
+            if (__qomo_echo_get_word(dev, 2) != cmd) {
                 applog(LOG_ERR, "unexpected echo for cmd 0x%04x", cmd);
                 return -1;
             }
-            *(int *)out = __qomo_echo_get_word(dev, 4);
+            *(int *)out = __qomo_echo_get_word(dev, 4) - 1;
             return 0;
 
-        case QOMO_WRITE_JOB:
+        case QOMO_WRITE_WORK:
             __qomo_exec_cmd(dev, cmd, chip_addr, in, 88);
-            memset(dev->prep + 2, 0, 88);
+            memset(dev->prep + 4, 0, 88);
             return __qomo_echo_assert(dev);
 
         case QOMO_GET_NONCE:
             __qomo_exec_cmd(dev, cmd, chip_addr, in, 4);
-            val = __qomo_echo_get_word(dev, 8);
+            val = __qomo_echo_get_word(dev, 2);
             if ((val & 0x0f00) != cmd) {
                 applog(LOG_ERR, "unexpected echo for cmd 0x%04x", cmd);
                 return -1;
             }
 
             ret[0] = val >> 12;
-            ret[1] = __qomo_echo_get_word(dev, 6);
+            ret[1] = __qomo_echo_get_word(dev, 4);
             ret[1] <<= 16;
-            ret[1] |= __qomo_echo_get_word(dev, 4);
+            ret[1] |= __qomo_echo_get_word(dev, 6);
             ret[2] = val & 0xff;
             return 0;
 
@@ -231,6 +280,7 @@ static int qomo_exec_cmd(struct qomo_device *dev, enum qomo_commands cmd,
             return __qomo_echo_assert(dev);
     }
 
+    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
     applog(LOG_ERR, "unknown qomo cmd 0x%04x", cmd);
     return -1;
 }
@@ -241,6 +291,7 @@ static void qomo_drv_detect(void)
 {
     int chains = 0, chips, ret, d, id = 0;
     char data[64];
+
     
     for (d = 0; d < ARRAY_SIZE(qomo_devices); d++) {
         struct qomo_device *dev = &qomo_devices[d];
@@ -248,8 +299,11 @@ static void qomo_drv_detect(void)
         dev->spi.delay = 0;
         dev->spi.mode = SPI_MODE_0;
         dev->spi.bits = 8;
+        dev->spi.txrx = linux_spi_txrx;
         dev->freq = DEFAULT_FREQ;
         dev->id = id++;
+        dev->sync_mode = SYNC_MODE;
+        dev->enabled = 1;
 
 #ifdef HAVE_LINUX_SPI_SPIDEV_H
         if(spi_open(&dev->spi, dev->spi_path) < 0) {
@@ -257,6 +311,10 @@ static void qomo_drv_detect(void)
             continue;
         }
 #endif
+
+        /* apply other default settings: freq, board, etc. */
+        drv_set_defaults(&qomo_drv, qomo_set_device_funcs,
+                dev, dev->spi_path, NULL, 1);
 
         /* add cgpu, use calloc which init memory to zero */
         struct cgpu_info *cgpu = calloc(1, sizeof(struct cgpu_info));
@@ -273,7 +331,6 @@ static void qomo_drv_detect(void)
     if (chains) applog(LOG_NOTICE, "QomoMiner detected, %d chains totally!", chains);
 }
 
-
 static bool qomo_thread_init(struct thr_info *thr)
 {
     struct cgpu_info *cgpu = thr->cgpu;
@@ -281,7 +338,7 @@ static bool qomo_thread_init(struct thr_info *thr)
     uint8_t reg[32];
     int ret, i;
 
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
+    applog(LOG_NOTICE, "starting dev %d", dev->id);
     /*
      * 1. configure DCDC to get correct voltage for each computing board
      * 2. perform HW reset for each computing board
@@ -296,7 +353,7 @@ static bool qomo_thread_init(struct thr_info *thr)
             "\x00\x00"
             /* 16 bits:
              * reserved 4
-             * BIST mode, mask update, job mode, power up mode
+             * BIST mode, mask update, broadcast work, power up mode
              * RO 8 */
             "\x0a\x00", NULL);
     if (ret < 0) {
@@ -370,14 +427,14 @@ static void wswap32cp(void *dst, void *src, int len)
     }
 }
 
-static void qomo_prepare_payload(uint8_t *pl, struct work *work)
+static void qomo_prepare_payload(struct qomo_device *dev, struct work *work)
 {
     uint32_t i;
+    uint8_t *pl = dev->payload;
 
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-    bswap_32mult(pl, work->data, 32);
-    bswap_32mult(pl + 32, work->data + 32, 32);
-    bswap_32mult(pl + 64, work->data + 64, 16);
+    bswap_32mult(pl, work->data, 32 / 4);
+    bswap_32mult(pl + 32, work->data + 32, 32 / 4);
+    bswap_32mult(pl + 64, work->data + 64, 16 / 4);
 
     /* start nonce */
     *(uint32_t *)&pl[64] = bswap_32(0x0);
@@ -393,10 +450,10 @@ static void qomo_prepare_payload(uint8_t *pl, struct work *work)
     pl[83] = work->target[31 - i - 2];
 }
 
-#if 0
 /* the code here is for matching block/byte order from network
  * to asic. just call test_byte_order(work) in function scanhash
  */
+#if 0
 void test_byte_feed(uint8_t *buf, uint8_t *src, int n, int loop, int s4, int s2)
 {
     uint8_t buf_s2[32], buf_s4[32], buf_loop[32];
@@ -492,63 +549,81 @@ for (;;);
 }
 #endif
 
-#ifdef SYNC_MODE    
+#if SYNC_MODE == 1
 static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
         int64_t __maybe_unused max_nonce)
 {
-    int nonce, ret[4];
+    int nonce, ret[4], i, work_id;
     struct cgpu_info *cgpu = thr->cgpu;
     struct qomo_device *dev = cgpu->device_data;
-    struct timeval start_tv, end_tv, nonce_scanned_tv;
-    uint8_t payload[128];
+    struct timeval start_tv, end_tv;
 
-    qomo_prepare_payload(payload, work);
-    printbin("payload:", payload, 88);
-    qomo_exec_cmd(dev, QOMO_WRITE_JOB, 0, payload, NULL);
-    timer_set_now(&start_tv);
-    timer_set_delay_from_now(&nonce_scanned_tv,
+    work_id = qomo_wp_alloc_id(&dev->wp, work);
+
+    qomo_prepare_payload(dev, work);
+//    printbin("payload:", dev->payload, 88);
+    qomo_exec_cmd(dev, QOMO_WRITE_WORK, work_id << 12, dev->payload, NULL);
+    timer_set_delay_from_now(&dev->wp.expire,
             (int)(dev->range_scan_time * 1000000 / CHIP_NR_MAX));
 
-    for(;;) {
+    timer_set_now(&start_tv);
+
+    for(i = 0;;i++) {
         /* we control the hash loop for ourselves, and set
          * work->blk.nonce to 0xffffffff at the end, so that
          * the outer loop (minerloop_scanhash@deviceapi.c)
          * will abandon this work and trigger the next one.
          */
 
-        /* new block arrived, abandon current jobs in all chips */
+        /* new block arrived, abandon current works in all chips */
         if(thr->work_restart) {
             applog(LOG_NOTICE, "work_restart required");
             break;
         }
 
         /* range nearly scanned */
-        if(timer_passed(&nonce_scanned_tv, NULL)) {
+        if(timer_passed(&dev->wp.expire, NULL)) {
             applog(LOG_NOTICE, "range scanned (time passed)");
             break;
         }
 
         /* scan for nonce */
         qomo_exec_cmd(dev, QOMO_GET_NONCE, 0, "\x00\x00\x00\x00", ret);
-        if (ret[0]) {
-            uint32_t _nonce[6] = {
-                0xbe8c9a19,
-                0x8e54a019,
-                0xd8249a19,
-                0x1a5d9a19,
-                0x029c9a19,
-                0x70c19a19,
-            };
-            static int nnn = 0;
-            ret[1] = _nonce[nnn++];
-            nnn = nnn > 3? 0: nnn;
-            //           applog(LOG_NOTICE, "submitting nonce: 0x%08x", ret[1]);
-            submit_nonce(thr, work, ret[1]);
-            dev->chip_perf[ret[2]]++;
+        work_id = ret[0];
+        nonce = ret[1];
+        chip_id = ret[2];
+
+        if (work_id) {
+            /* valid response */
+            struct qomo_wp *wp = &dev->wp;
+            int ood = 0;
+
+            if (timercmp(&wp->stamp_tv[work_id],
+                        &dev->valid_tv, >)) { /* valid nonce */
+                if (wp->work[work_id] == work)
+                    submit_nonce(thr, work, nonce);
+                else
+                    /* because we have cleared output queue
+                     * for previous works, so this is almost
+                     * imporssible. unless it is IC bug.
+                     */
+                    applog(LOG_ERR, "impossible thing happened");
+            } else {
+                ood = 1;
+                dev->nonce_ood++ ;
+            }
+
+            applog(LOG_NOTICE, "! nonce 0x%08x from %d.%d %s", nonce,
+                    dev->id, chip_id, ood ? "(out of date)": "");
+            dev->chip_perf[chip_id]++;
+
+            /* lucky time: try one more nonce */
+            continue ;
         }
 
-        /* sleep for a while thus let go of the bus */
-        cgsleep_ms(100);
+        /* if no nonce is found, sleep for a while
+         * thus to let go of the SPI bus */
+        cgsleep_ms(20);
     }
 
     /* clear potential results for the current work
@@ -556,46 +631,124 @@ static int64_t qomo_scanhash(struct thr_info *thr, struct work *work,
      */
     qomo_exec_cmd(dev, QOMO_RESET, 0, "\x00\x04", NULL);
 
+    /* in scanhash mode, work is freed immediately out this function,
+     * so there is no need to maintain this work any more
+     */
+    timer_set_now(&dev->valid_tv);
+    qomo_wp_invalidate(&dev->wp);
+
     work->blk.nonce = 0xffffffff;
+    applog(LOG_NOTICE, "%d times poll for nonce", i);
+
     timer_set_now(&end_tv);
     return (int)(dev->hash_rate * ms_tdiff(&end_tv, &start_tv) / 1000);
 }
-#else /* manage jobs for each chip separately */
-#endif
+#else /* manage works for each chip separately */
 
-char *qomo_set_device(struct cgpu_info * const cgpu,
-        const char *opt, const char *newval, char *reply) {
-    struct qomo_device *dev = cgpu->device_data;
+bool qomo_queue_append(struct thr_info *thr, struct work * const work)
+{
+    struct qomo_device *dev = cthr->cgpu->device_data;
 
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-    applog(LOG_NOTICE, "opt: %s, newval: %s", opt, newval);
-    sprintf(reply, "echo %s %s", opt, newval);
+    for (i = 1; i <= dev->chips_nr; i++) {
+        struct qomo_wp *wp = &dev->wp[i];
+        if (timer_passed(&wp->expire, NULL)) { // null is now
+            int work_id = qomo_wp_alloc_id(wp, work);
+            timer_set_delay_from_now(wp->expire,
+                    (int)(dev->range_scan_time * 1000000));
+
+            qomo_prepare_payload(dev, work);
+            qomo_exec_cmd(dev, QOMO_WRITE_WORK, work_id << 12, dev->payload, NULL);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static
+void qomo_queue_flush(struct thr_info * const thr)
+{
+    struct qomo_device *dev = cthr->cgpu->device_data;
+    struct qomo_wp *wp;
+    int i, j;
+
+    timer_set_now(&dev->valid_tv);
+    for (i = 1; i <= dev->chips_nr; i++) {
+        wp = &dev->wp[i];
+        qomo_exec_cmd(dev, QOMO_RESET, 0, "\x00\x04", NULL);
+        qomo_wp_invalidate(wp);
+    }
+}
+
+static
+void qomo_poll(struct thr_info * const thr)
+{
+    struct qomo_device *dev = cthr->cgpu->device_data;
+    uint32_t ret[4], work_id, nonce, chip_id, ood;
+    struct qomo_wp *wp;
+
+one_more_nonce:
+    if(qomo_exec_cmd(dev, QOMO_GET_NONCE, 0, "\x00\x00"
+                "\x00\x00", ret) < 0) goto out ;
+
+    work_id = ret[0];
+    nonce = ret[1];
+    chip_id = ret[2];
+    ood = 0;
+
+    if (work_id) {
+        if (chip_id < 1 || chip_id >= CHIP_NR_MAX) {
+            applog(LOG_ERR, "illeagle response: work id: %d, nonce:"
+                    " 0x%08x, chip: %d", work_id, nonce, chip_id);
+            goto out ;
+        }
+
+        /* valid response */
+        wp = dev->wp[chip_id];
+        if (timercmp(&wp->stamp_tv[work_id], &dev->valid_tv, >)) { /* valid nonce */
+            submit_nonce(thr, wp->work[work_id], nonce);
+        } else {
+            ood = 1;
+            dev->nonce_ood++ ;
+        }
+
+        applog(LOG_NOTICE, "! nonce 0x%08x from %d.%d %s", nonce,
+                dev->id, chip_id, ood ? "(out of date)": "");
+        dev->chip_perf[chip_id]++;
+        goto one_more_nonce;
+    }
+
+    /* no nonce yet */
+out:
+    cgsleep_ms(20);
+}
+
+#endif /* end SYNC_MDOE */
+
+const char *qomo_set_device(struct cgpu_info * const cgpu,
+        const char *opt, const char * newval, char * reply,
+        enum bfg_set_device_replytype *out_success)
+{
+    applog(LOG_NOTICE, "qomo set_device: opt: %s, newval: %s", opt, newval);
 
     if (strcmp(opt, "clock") == 0) {
         dev->freq = atof(newval);
         applog(LOG_NOTICE, "dev %d: freq set to %lf", dev->id, dev->freq);
     }
-    return NULL;
-}
 
-const char *qomo_set_device_live(struct cgpu_info * const cgpu,
-        const char *opt, const char * newval, char * reply,
-        enum bfg_set_device_replytype *out_success)
-{
-    applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-    applog(LOG_NOTICE, "opt: %s, newval: %s", opt, newval);
-
-    qomo_set_device(cgpu, opt, newval, reply);
     return NULL;
 }
 
 /* APIs support by qomo */
 static const struct bfg_set_device_definition
-qomo_set_device_funcs[] = {
-    {"clock", qomo_set_device_live, "set chips frequency, number, unit MHz"},
-    {"voltage", qomo_set_device_live, "set chips voltage, number, unit mV"},
-    {"fan-speed", qomo_set_device_live, "set fan-speed, 5 levels, [1, 2, 3, 4, 5]"}
+qomo_set_device_funcs_live[] = {
+    {"clock", qomo_set_device, "set chips frequency, number, unit MHz"},
+    {"voltage", qomo_set_device, "set chips voltage, number, unit mV"},
+    {"fan-speed", qomo_set_device, "set fan-speed, 5 levels, [1, 2, 3, 4, 5]"},
+    {NULL}
 };
+static const struct bfg_set_device_definition
+*qomo_set_device_funcs = qomo_set_device_funcs_live;
 
 struct api_data* qomo_get_api_extra_device_detail(struct cgpu_info *cgpu) {
     struct qomo_device *dev = cgpu->device_data;
@@ -604,7 +757,7 @@ struct api_data* qomo_get_api_extra_device_detail(struct cgpu_info *cgpu) {
     int i;
 
     res = api_add_int(res, "chips_nr", &dev->chips_nr, 1);
-    res = api_add_string(res, "work mode", dev->mode? "sync": "async", 1);
+    res = api_add_string(res, "work mode", dev->sync_mode? "sync": "async", 1);
 
     for (i = 0; i < dev->chips_nr; i++) {
         sprintf(name, "c_bist_%d", i);
@@ -648,7 +801,7 @@ struct device_drv qomo_drv = {
     .thread_disable = qomo_thread_disable,
     .thread_shutdown = qomo_thread_shutdown,
 
-#ifdef SYNC_MODE    
+#ifdef SYNC_MODE == 1
     .scanhash = qomo_scanhash,
 #else
     .minierloop = minerloop_queue,
@@ -663,7 +816,6 @@ struct device_drv qomo_drv = {
     .drv_min_nonce_diff = common_scrypt_min_nonce_diff,
 
     /* API */
-    .set_device = qomo_set_device,
     .get_api_extra_device_detail = qomo_get_api_extra_device_detail,
     .get_api_extra_device_status = qomo_get_api_extra_device_status,
 };
