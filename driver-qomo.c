@@ -33,8 +33,6 @@
 
 #ifdef HAVE_LINUX_SPI_SPIDEV_H
 #include <linux/spi/spidev.h>
-#else
-#define SPI_MODE_0 0
 #endif
 
 #include "deviceapi.h"
@@ -355,7 +353,12 @@ static bool qomo_thread_init(struct thr_info *thr)
              * reserved 4
              * BIST mode, mask update, broadcast work, power up mode
              * RO 8 */
-            "\x0a\x00", NULL);
+#if SYNC_MODE == 1
+            "\x0a\x00"
+#else
+            "\x08\x00"
+#endif
+            , NULL);
     if (ret < 0) {
         return false;
     }
@@ -415,16 +418,6 @@ static void qomo_thread_disable(struct thr_info * thr)
 static void qomo_thread_shutdown(struct thr_info * thr)
 {
     applog(LOG_NOTICE, "%s, %d", __func__, __LINE__);
-}
-
-static void wswap32cp(void *dst, void *src, int len)
-{
-    uint16_t *t = dst, *s = src;
-    int i = 0;
-    for (; i < len; i += 2, t += 2, s += 2) {
-        *(t + i) = *(s + i + 1);
-        *(t + i + 1) = *(s + i);
-    }
 }
 
 static void qomo_prepare_payload(struct qomo_device *dev, struct work *work)
@@ -658,7 +651,7 @@ bool qomo_queue_append(struct thr_info *thr, struct work * const work)
                     (int)(dev->range_scan_time * 1000000));
 
             qomo_prepare_payload(dev, work);
-            qomo_exec_cmd(dev, QOMO_WRITE_WORK, work_id << 12, dev->payload, NULL);
+            qomo_exec_cmd(dev, QOMO_WRITE_WORK, i | (work_id << 12), dev->payload, NULL);
             return true;
         }
     }
